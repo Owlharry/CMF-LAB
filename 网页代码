@@ -1,0 +1,653 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { Upload, X, ArrowRight, Zap, Droplet, Layers, Eye, Maximize2, AlertCircle, Plus, CarFront, Settings, Check, Lock, Sparkles, ChevronRight } from 'lucide-react';
+
+// --- 全局常量 ---
+const APP_TITLE = "CMF"; // 主标题简化
+const APP_SUFFIX = "LAB"; // 后缀分离
+const POWERED_BY = "POWERED BY Owlharry"; 
+const APP_VERSION = "v5.2.0-CN-Pro";
+
+// --- 样式注入 (保持液态美学不变) ---
+const STYLE_INJECTION = `
+  @keyframes float {
+    0% { transform: translate(0px, 0px) scale(1); }
+    33% { transform: translate(30px, -50px) scale(1.1); }
+    66% { transform: translate(-20px, 20px) scale(0.9); }
+    100% { transform: translate(0px, 0px) scale(1); }
+  }
+  .animate-blob {
+    animation: float 10s infinite ease-in-out;
+  }
+  .animation-delay-2000 { animation-delay: 2s; }
+  .animation-delay-4000 { animation-delay: 4s; }
+  
+  .glass-card {
+    background: rgba(20, 20, 23, 0.4);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
+  }
+  
+  .liquid-text {
+    background: linear-gradient(to right, #22d3ee, #e879f9, #22d3ee);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    background-size: 200% auto;
+    animation: shine 5s linear infinite;
+  }
+  
+  @keyframes shine {
+    to { background-position: 200% center; }
+  }
+`;
+
+// --- 模型配置定义 ---
+const MODEL_OPTIONS = {
+  analysis: [
+    { id: 'gemini_default', name: 'Gemini (Default)', type: 'default' },
+    { id: 'gemini_custom', name: 'Gemini (Custom API)', type: 'custom' },
+    { id: 'chatgpt', name: 'ChatGPT (OpenAI)', type: 'custom' },
+    { id: 'qwen', name: 'Qwen VL (通义千问)', type: 'custom' },
+    { id: 'doubao', name: 'Doubao (豆包)', type: 'custom' },
+    { id: 'kimi', name: 'Kimi (Moonshot)', type: 'custom' },
+  ],
+  rendering: [
+    { id: 'gemini_default', name: 'Gemini (Default)', type: 'default' },
+    { id: 'gemini_custom', name: 'Gemini (Custom API)', type: 'custom' },
+    { id: 'chatgpt', name: 'ChatGPT (OpenAI)', type: 'custom' },
+    { id: 'kling', name: 'Kling AI (可灵)', type: 'custom' },
+    { id: 'doubao', name: 'Doubao (豆包)', type: 'custom' },
+    { id: 'qwen', name: 'Qwen AI (通义万相)', type: 'custom' },
+    { id: 'kimi', name: 'Kimi (Moonshot)', type: 'custom' },
+  ]
+};
+
+// --- API 核心逻辑 ---
+const analyzePaintCMF = async (referenceImagesBase64, config) => {
+  const { provider, apiKey } = config;
+  const validImages = referenceImagesBase64.filter(img => img !== null);
+  if (validImages.length === 0) throw new Error("请至少上传一张参考图");
+
+  const systemPrompt = `
+    你是一位资深汽车CMF工程师。请综合分析提供的参考图，剔除环境光干扰，提取车漆物理属性。
+    输出严格JSON格式：
+    1. color_name: 中文商业命名 + 英文专业命名。
+    2. base_color: Hue, Value, Saturation 描述。
+    3. flake_type: 颗粒类型 (Metallic/Pearl/etc)。
+    4. travel_effect: 随角异色 (Face/Flop Tone)。
+    5. finish_type: 表面处理 (Gloss/Matte)。
+    6. synthesis_prompt: 用于AI生图的英文Prompt，强调 "photorealistic automotive paint"。
+  `;
+  const userPrompt = `基于这 ${validImages.length} 张图，分析车漆CMF属性。`;
+
+  switch (provider) {
+    case 'gemini_default': return await callGeminiAnalysis(userPrompt, systemPrompt, validImages, ""); 
+    case 'gemini_custom': if (!apiKey) throw new Error("请配置 Gemini API Key"); return await callGeminiAnalysis(userPrompt, systemPrompt, validImages, apiKey);
+    default: return await mockExternalCall(provider, apiKey, "Analysis");
+  }
+};
+
+const renderCarPaint = async (targetImageBase64, cmfData, config) => {
+  const { provider, apiKey } = config;
+  const prompt = `
+    Action: Repaint the car.
+    Style: Photorealistic 8k automotive photography.
+    Paint: ${cmfData.base_color}, ${cmfData.finish_type}, ${cmfData.flake_type}, ${cmfData.travel_effect}.
+    Specifics: ${cmfData.synthesis_prompt}
+    Constraint: Maintain car shape, lighting, background exactly. Only change paint.
+  `;
+
+  switch (provider) {
+    case 'gemini_default': return await callGeminiRendering(prompt, targetImageBase64, "");
+    case 'gemini_custom': if (!apiKey) throw new Error("请配置 Gemini API Key"); return await callGeminiRendering(prompt, targetImageBase64, apiKey);
+    default: return await mockExternalRender(provider, apiKey);
+  }
+};
+
+const callGeminiAnalysis = async (userPrompt, systemPrompt, images, apiKey) => {
+  const contentParts = [{ text: userPrompt }, ...images.map(img => ({ inlineData: { mimeType: "image/jpeg", data: img } }))];
+  const actualModel = "gemini-2.5-flash-preview-09-2025";
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${actualModel}:generateContent?key=${apiKey}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contents: [{ role: "user", parts: contentParts }], systemInstruction: { parts: [{ text: systemPrompt }] }, generationConfig: { responseMimeType: "application/json" } })
+  });
+  if (!response.ok) throw new Error("Gemini API 请求失败");
+  const data = await response.json();
+  return JSON.parse(data.candidates[0].content.parts[0].text);
+};
+
+const callGeminiRendering = async (prompt, imageBase64, apiKey) => {
+  const actualModel = "gemini-2.5-flash-image-preview";
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${actualModel}:generateContent?key=${apiKey}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }, { inlineData: { mimeType: "image/jpeg", data: imageBase64 } }] }], generationConfig: { responseModalities: ["IMAGE"] } })
+  });
+  if (!response.ok) throw new Error("Gemini 渲染服务响应错误");
+  const data = await response.json();
+  const generatedImage = data.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
+  if (!generatedImage) throw new Error("未能生成图像");
+  return generatedImage;
+};
+
+const mockExternalCall = async (modelName, apiKey, type) => {
+  await new Promise(r => setTimeout(r, 2000));
+  return {
+    color_name: `(来自 ${modelName}) 液态银翼 (Liquid Silver)`,
+    base_color: "Chrome-like silver with high reflectivity.",
+    flake_type: "Nano-scale smooth metallic.",
+    travel_effect: "Face: Bright Mirror, Flop: Dark Steel.",
+    finish_type: "Liquid Metal Finish",
+    synthesis_prompt: `A car painted in liquid metal silver, mirror finish, futuristic lighting, ${modelName} style.`
+  };
+};
+
+const mockExternalRender = async (modelName, apiKey) => {
+  await new Promise(r => setTimeout(r, 2000));
+  throw new Error(`演示模式：成功连接到 ${modelName}。为保证演示流畅，请使用 Gemini Default 通道体验真实生成。`);
+};
+
+
+// --- UI 组件 (已本地化 + 文案优化) ---
+
+const GlassCard = ({ children, className = "", onClick, hoverEffect = false }) => (
+  <div 
+    onClick={onClick}
+    className={`
+      glass-card rounded-2xl overflow-hidden transition-all duration-500
+      ${hoverEffect ? 'hover:shadow-[0_8px_40px_rgba(34,211,238,0.1)] hover:-translate-y-1 hover:border-white/10' : ''}
+      ${className}
+    `}
+  >
+    {children}
+  </div>
+);
+
+const Badge = ({ children, variant = "default" }) => {
+  const styles = {
+    default: "bg-white/5 text-zinc-400 border border-white/5",
+    accent: "bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 shadow-[0_0_10px_rgba(34,211,238,0.1)]",
+    warning: "bg-amber-500/10 text-amber-300 border border-amber-500/20",
+    outline: "bg-transparent border border-zinc-700 text-zinc-500",
+  };
+  return (
+    <span className={`px-2.5 py-1 text-[10px] font-medium uppercase tracking-widest rounded-full backdrop-blur-md ${styles[variant]}`}>
+      {children}
+    </span>
+  );
+};
+
+const Button = ({ children, onClick, disabled, variant = "primary", icon: Icon, className = "", size = "md" }) => {
+  const sizes = { sm: "px-4 py-2 text-xs", md: "px-6 py-3 text-sm", lg: "px-8 py-4 text-base" };
+  
+  const baseStyle = `
+    relative overflow-hidden group flex items-center justify-center gap-2 rounded-xl font-medium tracking-wide transition-all duration-300 
+    disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none
+    hover:-translate-y-0.5 active:translate-y-0 active:scale-95
+  `;
+  
+  const variants = {
+    primary: "bg-white text-black hover:bg-zinc-200 shadow-lg hover:shadow-xl",
+    secondary: "bg-zinc-800/50 text-white hover:bg-zinc-700/50 border border-white/5 backdrop-blur-md",
+    ghost: "bg-transparent text-zinc-400 hover:text-white hover:bg-white/5",
+    cyber: "bg-gradient-to-r from-cyan-600 to-blue-600 text-white shadow-[0_0_20px_rgba(8,145,178,0.4)] hover:shadow-[0_0_30px_rgba(8,145,178,0.6)] border border-cyan-400/20",
+  };
+
+  return (
+    <button onClick={onClick} disabled={disabled} className={`${baseStyle} ${sizes[size]} ${variants[variant]} ${className}`}>
+      <div className="absolute inset-0 w-full h-full bg-gradient-to-r from-transparent via-white/10 to-transparent -translate-x-full group-hover:animate-[shimmer_1.5s_infinite] pointer-events-none" />
+      <span className="relative flex items-center gap-2 z-10">
+        {Icon && <Icon size={size === 'sm' ? 14 : 18} />}
+        {children}
+      </span>
+    </button>
+  );
+};
+
+const FileUploader = ({ label, onUpload, currentImage, id, compact = false }) => {
+  const fileInputRef = useRef(null);
+  const handleFileChange = (e) => {
+    const file = e.target.files[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onloadend = () => onUpload(reader.result, reader.result.split(',')[1]);
+      reader.readAsDataURL(file);
+    }
+  };
+
+  return (
+    <div 
+      className={`
+        group relative w-full ${compact ? 'aspect-square' : 'aspect-video'} 
+        bg-zinc-900/30 border border-dashed border-zinc-700/50 rounded-xl 
+        hover:border-cyan-500/50 hover:bg-zinc-800/30 transition-all duration-300 
+        flex flex-col items-center justify-center overflow-hidden cursor-pointer
+      `}
+      onClick={() => fileInputRef.current.click()}
+    >
+      {currentImage ? (
+        <>
+          <img src={currentImage} alt="Preview" className="w-full h-full object-cover opacity-80 group-hover:scale-105 transition-transform duration-700" />
+          <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+            <Badge variant="default">点击更换</Badge>
+          </div>
+          <div className="absolute top-2 right-2 p-1.5 bg-black/60 backdrop-blur rounded-full hover:bg-red-500/80 transition-colors z-20" 
+               onClick={(e) => { e.stopPropagation(); onUpload(null, null); }}>
+             <X size={12} className="text-white"/>
+          </div>
+        </>
+      ) : (
+        <div className="text-center p-4 relative z-10">
+          <div className="w-12 h-12 mx-auto mb-3 rounded-full bg-zinc-800/50 flex items-center justify-center group-hover:scale-110 group-hover:bg-cyan-500/20 transition-all duration-300">
+            {compact ? <Plus className="h-5 w-5 text-zinc-500 group-hover:text-cyan-400" /> : <Upload className="h-6 w-6 text-zinc-500 group-hover:text-cyan-400" />}
+          </div>
+          {!compact && <p className="text-xs text-zinc-500 tracking-widest font-medium group-hover:text-zinc-300 transition-colors">{label}</p>}
+        </div>
+      )}
+      <input type="file" ref={fileInputRef} onChange={handleFileChange} className="hidden" accept="image/*" />
+      <div className="absolute top-2 left-2 pointer-events-none">
+         <span className="text-[9px] font-mono text-zinc-500 bg-black/40 backdrop-blur px-1.5 py-0.5 rounded-md border border-white/5">{id}</span>
+      </div>
+    </div>
+  );
+};
+
+const SettingsModal = ({ isOpen, onClose, config, onSave }) => {
+  const [localConfig, setLocalConfig] = useState(config);
+  const [activeTab, setActiveTab] = useState('analysis'); 
+
+  useEffect(() => { if (isOpen) setLocalConfig(config); }, [isOpen, config]);
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
+      <GlassCard className="w-full max-w-2xl bg-zinc-950/90 border-zinc-800 shadow-2xl relative z-10 flex flex-col max-h-[85vh]">
+        <div className="flex items-center justify-between p-6 border-b border-white/5">
+          <h3 className="text-xl font-light text-white flex items-center gap-3">
+            <Settings size={20} className="text-cyan-400" />
+            {/* 文案优化：核心矩阵配置 -> 引擎服务配置 */}
+            引擎服务配置 (Engine Config)
+          </h3>
+          <button onClick={onClose} className="text-zinc-500 hover:text-white transition-colors"><X size={24} /></button>
+        </div>
+        
+        <div className="flex p-2 bg-black/20">
+          {['analysis', 'rendering'].map(tab => (
+            <button 
+              key={tab}
+              className={`flex-1 py-3 text-sm font-medium rounded-lg transition-all duration-300 ${activeTab === tab ? 'bg-zinc-800 text-white shadow-lg' : 'text-zinc-500 hover:text-zinc-300'}`}
+              onClick={() => setActiveTab(tab)}
+            >
+              {/* 文案优化：视觉中枢/全息渲染 -> 视觉分析/图像生成 */}
+              {tab === 'analysis' ? '视觉分析 (Analysis)' : '图像生成 (Generation)'}
+            </button>
+          ))}
+        </div>
+
+        <div className="p-6 space-y-4 overflow-y-auto flex-1 custom-scrollbar">
+          {MODEL_OPTIONS[activeTab].map((model) => (
+            <div 
+              key={model.id} 
+              className={`p-4 rounded-xl border cursor-pointer transition-all duration-300 ${
+                (activeTab === 'analysis' ? localConfig.analysisProvider : localConfig.renderingProvider) === model.id 
+                ? 'bg-cyan-900/10 border-cyan-500/50 shadow-[0_0_20px_rgba(34,211,238,0.1)]' 
+                : 'bg-zinc-900/30 border-white/5 hover:border-zinc-700 hover:bg-zinc-800/30'
+              }`}
+              onClick={() => setLocalConfig(prev => ({ ...prev, [activeTab === 'analysis' ? 'analysisProvider' : 'renderingProvider']: model.id }))}
+            >
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center gap-3">
+                  <div className={`w-5 h-5 rounded-full border flex items-center justify-center transition-colors ${
+                    (activeTab === 'analysis' ? localConfig.analysisProvider : localConfig.renderingProvider) === model.id
+                    ? 'border-cyan-400' : 'border-zinc-600'
+                  }`}>
+                    {(activeTab === 'analysis' ? localConfig.analysisProvider : localConfig.renderingProvider) === model.id && <div className="w-2.5 h-2.5 rounded-full bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.8)]" />}
+                  </div>
+                  <span className="font-medium text-zinc-200">{model.name}</span>
+                </div>
+                {model.type === 'custom' && <Badge variant="outline">需 API Key</Badge>}
+              </div>
+              
+              {model.type === 'custom' && (activeTab === 'analysis' ? localConfig.analysisProvider : localConfig.renderingProvider) === model.id && (
+                <div className="mt-3 pl-8 animate-in fade-in slide-in-from-top-2 duration-300">
+                  <div className="flex items-center gap-3 bg-black/40 border border-white/10 rounded-lg px-4 py-3 focus-within:border-cyan-500/50 transition-colors">
+                    <Lock size={14} className="text-zinc-500" />
+                    <input 
+                      type="password" 
+                      placeholder={`请输入 ${model.name} API Key`}
+                      className="bg-transparent border-none focus:outline-none text-sm text-zinc-200 w-full placeholder:text-zinc-600 font-mono"
+                      value={localConfig.apiKeys[model.id] || ''}
+                      onChange={(e) => setLocalConfig(prev => ({ ...prev, apiKeys: { ...prev.apiKeys, [model.id]: e.target.value } }))}
+                      onClick={(e) => e.stopPropagation()}
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+
+        <div className="p-6 border-t border-white/5 flex justify-end gap-4 bg-black/20">
+          <Button variant="ghost" onClick={onClose}>取消</Button>
+          <Button variant="cyber" onClick={() => { onSave(localConfig); onClose(); }}>应用配置</Button>
+        </div>
+      </GlassCard>
+    </div>
+  );
+};
+
+const CMFAnalysisPanel = ({ data, isLoading, providerName }) => {
+  if (isLoading) {
+    return (
+      <GlassCard className="h-full min-h-[400px] flex flex-col items-center justify-center p-12 border-cyan-500/20 bg-cyan-900/5 relative overflow-hidden">
+         <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(34,211,238,0.1),transparent_70%)] animate-pulse" />
+         <div className="w-20 h-20 border-t-2 border-l-2 border-cyan-400 rounded-full animate-spin mb-6 shadow-[0_0_30px_rgba(34,211,238,0.2)]" />
+         <p className="text-cyan-400 font-mono text-lg tracking-widest animate-pulse">深度分析中...</p>
+         {/* 文案优化：核心 -> 模型 */}
+         <p className="text-zinc-500 text-xs mt-3 uppercase tracking-wider font-mono">模型: {providerName}</p>
+      </GlassCard>
+    );
+  }
+
+  if (!data) {
+    return (
+      <GlassCard className="h-full min-h-[400px] flex flex-col items-center justify-center p-12 bg-zinc-900/20 border-dashed border-zinc-800">
+        <Layers className="h-16 w-16 text-zinc-800 mb-6" strokeWidth={1} />
+        <p className="text-zinc-500 font-light text-center tracking-wide">等待参考图输入...<br/><span className="text-xs opacity-50">Upload reference material</span></p>
+      </GlassCard>
+    );
+  }
+
+  return (
+    <GlassCard className="h-full p-0 border-cyan-500/20 bg-zinc-900/60 flex flex-col">
+      <div className="p-6 border-b border-white/5 bg-white/5 flex justify-between items-center backdrop-blur-md">
+        <h3 className="font-bold text-zinc-100 flex items-center gap-3">
+          <div className="w-8 h-8 rounded-lg bg-cyan-500/20 flex items-center justify-center"><Zap size={16} className="text-cyan-400" /></div>
+          CMF 分析报告
+        </h3>
+        <Badge variant="accent">完成</Badge>
+      </div>
+      <div className="p-8 space-y-8 overflow-y-auto custom-scrollbar flex-1">
+        <div>
+          <label className="text-zinc-500 text-[10px] uppercase tracking-[0.2em] block mb-2">Color Identity (色彩定义)</label>
+          <div className="text-2xl text-transparent bg-clip-text bg-gradient-to-r from-white to-zinc-400 font-light tracking-tight">{data.color_name}</div>
+        </div>
+        <div className="grid grid-cols-2 gap-8">
+          <div>
+            <label className="text-zinc-500 text-[10px] uppercase tracking-[0.2em] block mb-2">Finish (表面处理)</label>
+            <div className="flex items-center gap-3 text-zinc-300 text-sm"><Droplet size={14} className="text-cyan-400" /> {data.finish_type}</div>
+          </div>
+          <div>
+            <label className="text-zinc-500 text-[10px] uppercase tracking-[0.2em] block mb-2">Flake (颗粒特征)</label>
+            <div className="flex items-center gap-3 text-zinc-300 text-sm"><Sparkles size={14} className="text-amber-400" /> {data.flake_type}</div>
+          </div>
+        </div>
+        <div className="bg-white/5 p-5 rounded-xl border border-white/5">
+          <label className="text-zinc-500 text-[10px] uppercase tracking-[0.2em] block mb-3">Optical Physics (物理光学参数)</label>
+          <p className="text-zinc-300 text-xs leading-relaxed font-mono">{data.base_color}</p>
+        </div>
+        <div className="bg-white/5 p-5 rounded-xl border border-white/5">
+          <label className="text-zinc-500 text-[10px] uppercase tracking-[0.2em] block mb-3">Flip-Flop (随角异色)</label>
+          <p className="text-zinc-300 text-xs leading-relaxed font-mono">{data.travel_effect}</p>
+        </div>
+      </div>
+    </GlassCard>
+  );
+};
+
+const ComparisonGallery = ({ original, generated, label, isProcessing, providerName }) => {
+  if (!original && !generated) return null;
+  return (
+    <div className="mb-10 group">
+      <div className="flex items-center justify-between mb-4 px-2">
+        <h4 className="text-sm font-medium text-zinc-400 uppercase tracking-[0.15em] flex items-center gap-2">
+          <span className="w-1.5 h-1.5 bg-cyan-500 rounded-full" /> {label}
+        </h4>
+        {isProcessing && <span className="text-xs text-amber-500 animate-pulse font-mono">渲染中...</span>}
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        {/* Before */}
+        <GlassCard className="relative aspect-video bg-black/40 border-0 group-hover:border-white/5">
+          {original ? <img src={original} className="w-full h-full object-cover opacity-80" alt="Orig" /> : <div className="text-zinc-700 m-auto">空</div>}
+          <div className="absolute top-4 left-4"><Badge variant="default">原始</Badge></div>
+        </GlassCard>
+        
+        {/* After */}
+        <GlassCard className={`relative aspect-video bg-black/40 border-0 transition-all duration-500 ${isProcessing ? 'border-amber-500/30' : 'group-hover:shadow-[0_0_50px_rgba(34,211,238,0.15)] group-hover:border-cyan-500/30'}`}>
+           {isProcessing ? (
+             <div className="w-full h-full flex flex-col items-center justify-center relative overflow-hidden">
+                <div className="absolute inset-0 bg-gradient-to-b from-amber-500/10 to-transparent animate-pulse" />
+                <div className="w-10 h-10 border-2 border-amber-500 border-t-transparent rounded-full animate-spin mb-4" />
+                <span className="text-[10px] text-amber-500 font-mono tracking-widest">生成中 // {providerName}</span>
+             </div>
+           ) : generated ? (
+             <img src={generated.startsWith('data:') ? generated : `data:image/jpeg;base64,${generated}`} className="w-full h-full object-cover" alt="Gen" />
+           ) : (
+             <div className="w-full h-full flex items-center justify-center text-zinc-700 border-2 border-dashed border-zinc-800"><span className="text-xs text-zinc-600">等待生成</span></div>
+           )}
+           {generated && !isProcessing && <div className="absolute top-4 left-4"><Badge variant="accent">AI 渲染</Badge></div>}
+        </GlassCard>
+      </div>
+    </div>
+  );
+};
+
+
+// --- Main App Component ---
+
+export default function App() {
+  const [targetImages, setTargetImages] = useState([null, null, null]); 
+  const [targetImagesRaw, setTargetImagesRaw] = useState([null, null, null]); 
+  const [referenceImages, setReferenceImages] = useState([null, null, null]);
+  const [referenceImagesRaw, setReferenceImagesRaw] = useState([null, null, null]);
+  const [analysisResult, setAnalysisResult] = useState(null);
+  const [generatedImages, setGeneratedImages] = useState([null, null, null]);
+  const [status, setStatus] = useState("IDLE"); 
+  const [errorMessage, setErrorMessage] = useState("");
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [appConfig, setAppConfig] = useState({ analysisProvider: 'gemini_default', renderingProvider: 'gemini_default', apiKeys: {} });
+
+  const handleTargetUpload = (i, url, raw) => { const n=[...targetImages],nr=[...targetImagesRaw]; n[i]=url; nr[i]=raw; setTargetImages(n); setTargetImagesRaw(nr); };
+  const handleReferenceUpload = (i, url, raw) => { const n=[...referenceImages],nr=[...referenceImagesRaw]; n[i]=url; nr[i]=raw; setReferenceImages(n); setReferenceImagesRaw(nr); setAnalysisResult(null); setStatus("IDLE"); };
+
+  const runAnalysis = async () => {
+    if (referenceImagesRaw.every(img => img === null)) return;
+    setStatus("ANALYZING"); setErrorMessage("");
+    try { setAnalysisResult(await analyzePaintCMF(referenceImagesRaw, { provider: appConfig.analysisProvider, apiKey: appConfig.apiKeys[appConfig.analysisProvider] })); setStatus("ANALYZED"); } 
+    catch (e) { setErrorMessage(e.message || "分析失败"); setStatus("ERROR"); }
+  };
+
+  const runSynthesis = async () => {
+    if (!analysisResult) return;
+    setStatus("RENDERING"); setErrorMessage("");
+    try {
+      const results = await Promise.all(targetImagesRaw.map(async (imgRaw, index) => {
+        if (!imgRaw) return null;
+        return await renderCarPaint(imgRaw, analysisResult, { provider: appConfig.renderingProvider, apiKey: appConfig.apiKeys[appConfig.renderingProvider] });
+      }));
+      setGeneratedImages(results); setStatus("COMPLETED");
+    } catch (e) { setErrorMessage(e.message || "渲染失败"); setStatus("ERROR"); }
+  };
+
+  const refCount = referenceImages.filter(Boolean).length;
+  const getCurrentModelName = (type) => {
+    const providerId = type === 'analysis' ? appConfig.analysisProvider : appConfig.renderingProvider;
+    const model = MODEL_OPTIONS[type].find(m => m.id === providerId);
+    return model ? model.name.split('(')[0].trim() : 'Unknown';
+  };
+
+  return (
+    <div className="min-h-screen bg-black text-zinc-100 font-sans selection:bg-cyan-500/30 selection:text-cyan-200 relative overflow-x-hidden">
+      <style>{STYLE_INJECTION}</style>
+      
+      {/* 5. 动态背景：流光 Mesh Gradient */}
+      <div className="fixed inset-0 z-0 pointer-events-none">
+         <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-purple-900/30 rounded-full blur-[120px] animate-blob" />
+         <div className="absolute top-[20%] right-[-10%] w-[35%] h-[35%] bg-cyan-900/20 rounded-full blur-[100px] animate-blob animation-delay-2000" />
+         <div className="absolute bottom-[-10%] left-[20%] w-[40%] h-[40%] bg-blue-900/20 rounded-full blur-[120px] animate-blob animation-delay-4000" />
+      </div>
+
+      <SettingsModal isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} config={appConfig} onSave={setAppConfig} />
+
+      <nav className="border-b border-white/5 bg-black/50 backdrop-blur-xl sticky top-0 z-50">
+        <div className="max-w-[1600px] mx-auto px-8 h-20 flex items-center justify-between">
+          <div className="flex items-center gap-5">
+            {/* 6. 液态金属质感 Logo 容器 (优化：CMF LAB) */}
+            <div className="w-11 h-11 bg-gradient-to-br from-zinc-800 to-black rounded-xl border border-white/10 flex items-center justify-center relative overflow-hidden shadow-xl group">
+               <div className="absolute inset-0 bg-gradient-to-tr from-cyan-500/20 to-purple-500/20 opacity-50 group-hover:opacity-100 transition-opacity" />
+               <div className="absolute -inset-[100%] bg-white/10 rotate-45 group-hover:translate-x-[200%] transition-transform duration-700" />
+               <CarFront size={22} className="text-zinc-200 relative z-10" />
+            </div>
+            <div className="flex flex-col">
+              <h1 className="font-bold tracking-tight text-xl leading-none font-mono">
+                {/* 视觉修复：CMF LAB */}
+                {APP_TITLE} <span className="text-cyan-500 text-lg">{APP_SUFFIX}</span>
+              </h1>
+              <span className="text-[9px] text-zinc-500 font-mono tracking-[0.2em] mt-1">{POWERED_BY}</span>
+            </div>
+          </div>
+          <div className="flex items-center gap-6">
+             <div className="hidden lg:flex flex-col items-end gap-1 mr-2">
+                <div className="flex items-center gap-2 text-[10px] font-mono text-zinc-500 bg-white/5 px-2 py-0.5 rounded-full border border-white/5">
+                   {/* 文案优化：大脑/渲染 -> 分析/生成 */}
+                   <span className="w-1.5 h-1.5 rounded-full bg-purple-500 animate-pulse" /> 分析: {getCurrentModelName('analysis')}
+                </div>
+                <div className="flex items-center gap-2 text-[10px] font-mono text-zinc-500 bg-white/5 px-2 py-0.5 rounded-full border border-white/5">
+                   <span className="w-1.5 h-1.5 rounded-full bg-cyan-500 animate-pulse" /> 生成: {getCurrentModelName('rendering')}
+                </div>
+             </div>
+             <Button variant="secondary" size="sm" onClick={() => setIsSettingsOpen(true)} icon={Settings}>
+               配置
+             </Button>
+          </div>
+        </div>
+      </nav>
+
+      {/* 2. 布局优化：左右分栏 + 大间距 */}
+      <main className="max-w-[1600px] mx-auto p-8 relative z-10">
+        
+        {/* 头部：大留白 + 液态文字 */}
+        <section className="py-12 mb-8 flex flex-col md:flex-row md:items-end justify-between gap-8 border-b border-white/5">
+          <div>
+            <h2 className="text-5xl font-light text-white mb-4 tracking-tight">
+              虚拟 <span className="liquid-text font-bold">涂装实验室</span>
+            </h2>
+            <p className="text-zinc-400 max-w-xl text-base font-light leading-relaxed">
+              体验次世代 CMF 可视化引擎。 
+              由 <span className="text-white font-medium">{getCurrentModelName('analysis')}</span> & <span className="text-white font-medium">{getCurrentModelName('rendering')}</span> 驱动。
+            </p>
+          </div>
+          {status === "ERROR" && (
+            <div className="flex items-center gap-3 text-red-400 bg-red-950/20 backdrop-blur px-6 py-4 rounded-xl border border-red-900/50 shadow-lg animate-in slide-in-from-right-10">
+               <AlertCircle size={20} /> <span className="text-sm font-medium">{errorMessage}</span>
+            </div>
+          )}
+        </section>
+
+        {/* 主内容网格：12 列布局，增大 Gap */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-12">
+          
+          {/* 左侧：控制面板 (4列) */}
+          <div className="lg:col-span-4 space-y-8 h-fit lg:sticky lg:top-24">
+            
+            {/* 1. 材质参考卡片 */}
+            <section className="space-y-4">
+              <div className="flex items-center justify-between px-1">
+                <h3 className="text-xs font-bold text-zinc-400 uppercase tracking-[0.2em] flex items-center gap-2">
+                   <Eye size={14} className="text-purple-400"/> 材质参考
+                </h3>
+                <span className="text-[10px] text-zinc-600 font-mono bg-white/5 px-2 py-0.5 rounded-full">{refCount} / 3</span>
+              </div>
+              <GlassCard className="p-6 bg-zinc-900/40" hoverEffect={true}>
+                <div className="grid grid-cols-3 gap-3">
+                    {[0,1,2].map(i => (
+                      <FileUploader key={i} id={`REF 0${i+1}`} label={`图 ${i+1}`} compact={true} onUpload={(url, raw) => handleReferenceUpload(i, url, raw)} currentImage={referenceImages[i]} />
+                    ))}
+                </div>
+                <div className="mt-6">
+                  <Button 
+                    variant={status === "ANALYZING" ? "ghost" : "primary"}
+                    className="w-full"
+                    onClick={runAnalysis}
+                    disabled={refCount === 0 || status === "ANALYZING"}
+                  >
+                    {status === "ANALYZING" ? "正在分析材质..." : "开始 CMF 提取"} 
+                    {!status.includes("ANALYZING") && <ArrowRight size={16} />}
+                  </Button>
+                </div>
+              </GlassCard>
+            </section>
+
+            {/* 分析结果 */}
+            <section className="space-y-4">
+               <CMFAnalysisPanel data={analysisResult} isLoading={status === "ANALYZING"} providerName={getCurrentModelName('analysis')} />
+            </section>
+
+          </div>
+
+          {/* 右侧：目标与画廊 (8列) */}
+          <div className="lg:col-span-8 space-y-12">
+             
+             {/* 2. 目标车辆卡片 */}
+             <section className="space-y-6">
+                <div className="flex items-center justify-between px-1 border-b border-white/5 pb-4">
+                  <h3 className="text-xs font-bold text-zinc-400 uppercase tracking-[0.2em] flex items-center gap-2">
+                    <Layers size={14} className="text-cyan-400"/> 目标模型
+                  </h3>
+                  <div className="flex items-center gap-2 text-[10px] text-zinc-500">
+                    <span className="w-2 h-2 rounded-full bg-zinc-700"></span> 3 视角
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-3 gap-6">
+                   <FileUploader id="FRONT" label="前视图" currentImage={targetImages[0]} onUpload={(url, raw) => handleTargetUpload(0, url, raw)} />
+                   <FileUploader id="SIDE" label="侧视图" currentImage={targetImages[1]} onUpload={(url, raw) => handleTargetUpload(1, url, raw)} />
+                   <FileUploader id="REAR" label="后视图" currentImage={targetImages[2]} onUpload={(url, raw) => handleTargetUpload(2, url, raw)} />
+                </div>
+
+                <div className="flex justify-end pt-4">
+                   <Button 
+                     variant="cyber" 
+                     size="lg"
+                     disabled={status !== "ANALYZED" && status !== "COMPLETED"} 
+                     onClick={runSynthesis}
+                     className="w-full md:w-auto"
+                   >
+                     {status === "RENDERING" ? "正在合成涂装..." : "启动喷涂程序"}
+                     {status !== "RENDERING" && <Zap size={18} className="fill-current" />}
+                   </Button>
+                </div>
+             </section>
+
+             {/* 3. 结果画廊 */}
+             <section className="space-y-6 pt-6">
+                <div className="flex items-center justify-between px-1 border-b border-white/5 pb-4">
+                   <h3 className="text-xs font-bold text-zinc-400 uppercase tracking-[0.2em] flex items-center gap-2">
+                     <Maximize2 size={14} className="text-amber-400"/> 渲染画廊
+                   </h3>
+                </div>
+                
+                <div className="space-y-8">
+                   {['前视角度', '侧视角度', '后视角度'].map((label, i) => (
+                      <ComparisonGallery 
+                        key={i} 
+                        label={label} 
+                        original={targetImages[i]} 
+                        generated={generatedImages[i]} 
+                        isProcessing={status === "RENDERING"} 
+                        providerName={getCurrentModelName('rendering')} 
+                      />
+                   ))}
+                </div>
+             </section>
+
+          </div>
+        </div>
+      </main>
+    </div>
+  );
+}
